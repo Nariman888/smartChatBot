@@ -42,8 +42,8 @@ const theme = createTheme({
 
 function App() {
   const [currentTab, setCurrentTab] = useState(0);
-  const [selectedBusinessType, setSelectedBusinessType] = useState<BusinessType | null>(null);
-  const [customPrompt, setCustomPrompt] = useState<string | undefined>(undefined);
+  const [selectedBusinessType] = useState<BusinessType | null>(null);
+  const [customPrompt] = useState<string | undefined>(undefined);
 
 
 

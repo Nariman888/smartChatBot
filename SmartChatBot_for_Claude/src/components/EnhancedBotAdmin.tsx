@@ -276,7 +276,7 @@ const EnhancedBotAdmin: React.FC = () => {
       )}
 
       <Paper sx={{ mb: 3 }}>
-        <Tabs value={tabValue} onChange={(e, v) => setTabValue(v)}>
+        <Tabs value={tabValue} onChange={(_, v) => setTabValue(v)}>
           <Tab label="Основные настройки" icon={<Settings />} />
           <Tab label="Мессенджеры" icon={<Message />} />
           <Tab label="AI и языки" icon={<Psychology />} />
