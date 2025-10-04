@@ -15,6 +15,7 @@ import QRPaymentService from './services/qrPayment';
 import GoogleIntegration from './services/googleIntegration';
 import VoiceRecognitionService from './services/voiceRecognition';
 import PDFGeneratorService from './services/pdfGenerator';
+import DocumentWorkflowService from './services/documentWorkflow';
 import { constructionCatalog, searchProducts, calculateTotal, findProductBySKU } from './data/constructionCatalog';
 import * as waCloud from './services/waCloud';
 import { z } from 'zod';
@@ -47,6 +48,7 @@ const qrPaymentService = new QRPaymentService();
 const googleIntegration = new GoogleIntegration();
 const voiceRecognition = new VoiceRecognitionService(process.env.OPENAI_API_KEY);
 const pdfGenerator = new PDFGeneratorService();
+const documentWorkflow = new DocumentWorkflowService(googleIntegration);
 
 // User language preferences storage
 const userLanguages = new Map<number | string, string>();
@@ -76,6 +78,10 @@ async function initDatabase() {
         google_drive_folder_id VARCHAR(200),
         google_sheets_prices_id VARCHAR(200),
         google_sheets_leads_id VARCHAR(200),
+        proposal_template_id VARCHAR(200),
+        invoice_template_id VARCHAR(200),
+        default_currency VARCHAR(10) DEFAULT 'KZT',
+        catalog_enabled BOOLEAN DEFAULT false,
         kaspi_merchant_id VARCHAR(100),
         halyk_iin VARCHAR(100),
         manager_telegram_id VARCHAR(100),
@@ -84,6 +90,11 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    await pool.query(`ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS proposal_template_id VARCHAR(200)`);
+    await pool.query(`ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS invoice_template_id VARCHAR(200)`);
+    await pool.query(`ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS default_currency VARCHAR(10) DEFAULT 'KZT'`);
+    await pool.query(`ALTER TABLE bot_configs ADD COLUMN IF NOT EXISTS catalog_enabled BOOLEAN DEFAULT false`);
 
     // Enhanced chat history with language detection
     await pool.query(`
@@ -255,19 +266,121 @@ function initTelegramBot(businessId: string, token: string, config: any) {
       }
     }
     
+    const sendWorkflowResult = async (result: any) => {
+      if (!result) return true;
+
+      if (result.status === 'question') {
+        if (result.message) {
+          await bot.sendMessage(chatId, result.message);
+        }
+        if (result.question) {
+          await bot.sendMessage(chatId, result.question);
+        }
+        return true;
+      }
+
+      if (result.status === 'completed' && result.pdfBuffer) {
+        const caption = result.webViewLink
+          ? `${result.caption || ''}\n[Открыть в Google Docs](${result.webViewLink})`
+          : result.caption;
+
+        await bot.sendDocument(
+          chatId,
+          result.pdfBuffer,
+          { caption: caption || undefined, parse_mode: result.webViewLink ? 'Markdown' : undefined },
+          { filename: result.fileName || 'document.pdf', contentType: 'application/pdf' }
+        );
+        return true;
+      }
+
+      if (result.status === 'cancelled' && result.message) {
+        await bot.sendMessage(chatId, result.message);
+        return true;
+      }
+
+      if (result.status === 'error' && result.message) {
+        await bot.sendMessage(chatId, result.message);
+        return true;
+      }
+
+      return false;
+    };
+
+    if (documentWorkflow.isCollecting(userId, 'telegram')) {
+      const workflowResult = await documentWorkflow.processAnswer(userId, 'telegram', text);
+      await sendWorkflowResult(workflowResult);
+      return;
+    }
+
+    const lowerText = text.toLowerCase();
+    const defaultWorkflowValues = {
+      BUSINESS_NAME: config.business_name,
+      COMPANY_NAME: config.business_name,
+      BUSINESS_PHONE: config.manager_whatsapp || '',
+      DEFAULT_CURRENCY: config.default_currency || 'KZT'
+    };
+
+    if (config.invoice_template_id) {
+      const invoiceDirectMatch = /(\bсч[её]т\b|счет на оплату|сч[её]т на оплату|invoice|выставить счет)/.test(lowerText);
+      if (invoiceDirectMatch) {
+        const startResult = await documentWorkflow.startWorkflow({
+          userId,
+          platform: 'telegram',
+          type: 'invoice',
+          templateId: config.invoice_template_id,
+          folderId: config.google_drive_folder_id || undefined,
+          language: userLang as any,
+          businessId,
+          businessName: config.business_name,
+          defaultValues: defaultWorkflowValues,
+          outputName: `Invoice-${new Date().toISOString().split('T')[0]}-${userId}`
+        });
+        await sendWorkflowResult(startResult);
+        return;
+      }
+    }
+
+    if (config.proposal_template_id) {
+      const proposalDirectMatch = /(коммерческое предложение|коммерческое|\bкп\b|commercial offer|quotation)/.test(lowerText);
+      if (proposalDirectMatch) {
+        const startResult = await documentWorkflow.startWorkflow({
+          userId,
+          platform: 'telegram',
+          type: 'proposal',
+          templateId: config.proposal_template_id,
+          folderId: config.google_drive_folder_id || undefined,
+          language: userLang as any,
+          businessId,
+          businessName: config.business_name,
+          defaultValues: defaultWorkflowValues,
+          outputName: `Proposal-${new Date().toISOString().split('T')[0]}-${userId}`
+        });
+        await sendWorkflowResult(startResult);
+        return;
+      }
+    }
+
     // Always use AI as primary consultant, not sales funnel
     const response = await generateResponse(businessId, text, 'telegram', userId, userLang as any);
     if (response) {
       // Parse response for special actions
-      const needsQuote = response.toLowerCase().includes('коммерческое предложение') || 
-                        response.toLowerCase().includes('составить кп') ||
-                        response.toLowerCase().includes('подготовить предложение');
-      
+      const responseLower = response.toLowerCase();
+      const needsQuote = responseLower.includes('коммерческое предложение') ||
+                        responseLower.includes('составить кп') ||
+                        responseLower.includes('подготовить предложение');
+      const needsInvoice = /\bсч[её]т\b/.test(responseLower) ||
+                        responseLower.includes('счет на оплату') ||
+                        responseLower.includes('invoice');
+
       const keyboard: any[] = [];
-      
+
       // Add relevant buttons based on context
-      if (needsQuote || response.includes('₸') || response.includes('цен')) {
+      if ((needsQuote || response.includes('₸') || response.includes('цен')) && config.proposal_template_id) {
         keyboard.push([{ text: '📄 Получить КП в PDF', callback_data: 'generate_quote' }]);
+      }
+
+      if (needsInvoice && config.invoice_template_id) {
+        keyboard.push([{ text: '🧾 Счет на оплату', callback_data: 'generate_invoice' }]);
       }
       
       if (response.toLowerCase().includes('каталог') || response.toLowerCase().includes('товар')) {
@@ -293,9 +406,48 @@ function initTelegramBot(businessId: string, token: string, config: any) {
     const chatId = msg?.chat.id;
     const data = callbackQuery.data;
     const userId = callbackQuery.from.id.toString();
-    
+
     if (!chatId) return;
-    
+
+    const lang = (userLanguages.get(chatId) || 'ru') as 'ru' | 'kz' | 'en';
+    const defaultWorkflowValues = {
+      BUSINESS_NAME: config.business_name,
+      COMPANY_NAME: config.business_name,
+      BUSINESS_PHONE: config.manager_whatsapp || '',
+      DEFAULT_CURRENCY: config.default_currency || 'KZT'
+    };
+
+    const handleWorkflowResult = async (result: any) => {
+      if (!result) return;
+
+      if (result.status === 'question') {
+        if (result.message) {
+          await bot.sendMessage(chatId, result.message);
+        }
+        if (result.question) {
+          await bot.sendMessage(chatId, result.question);
+        }
+        return;
+      }
+
+      if (result.status === 'completed' && result.pdfBuffer) {
+        const caption = result.webViewLink
+          ? `${result.caption || ''}\n[Открыть в Google Docs](${result.webViewLink})`
+          : result.caption;
+        await bot.sendDocument(
+          chatId,
+          result.pdfBuffer,
+          { caption: caption || undefined, parse_mode: result.webViewLink ? 'Markdown' : undefined },
+          { filename: result.fileName || 'document.pdf', contentType: 'application/pdf' }
+        );
+        return;
+      }
+
+      if ((result.status === 'cancelled' || result.status === 'error') && result.message) {
+        await bot.sendMessage(chatId, result.message);
+      }
+    };
+
     switch (data) {
       case 'lang_ru':
         userLanguages.set(chatId, 'ru');
@@ -379,23 +531,64 @@ function initTelegramBot(businessId: string, token: string, config: any) {
         
       case 'catalog':
       case 'show_catalog':
-        // Send catalog based on business type
-        if (businessId === 'construct_shop' || config.business_type === 'construction') {
-          let catalogText = '📋 **КАТАЛОГ СТРОЙМАТЕРИАЛОВ**\n\n';
-          
-          for (const [catKey, category] of Object.entries(constructionCatalog.categories)) {
-            catalogText += `**${category.name}:**\n`;
-            category.products.slice(0, 3).forEach((p: any) => {
-              catalogText += `• ${p.name}: ${p.price} ₸/${p.unit}\n`;
-            });
-            catalogText += '\n';
+        try {
+          if (config.google_sheets_prices_id) {
+            if (!googleIntegration.isInitialized()) {
+              await googleIntegration.init();
+            }
+
+            const products = await googleIntegration.getProducts(config.google_sheets_prices_id);
+
+            if (!products.length) {
+              await bot.sendMessage(chatId, 'Каталог пока пуст. Добавьте товары в Google Sheets.');
+              break;
+            }
+
+            const grouped = products.reduce((acc: Map<string, typeof products>, product) => {
+              const category = product.category || 'Прочее';
+              if (!acc.has(category)) {
+                acc.set(category, []);
+              }
+              acc.get(category)!.push(product);
+              return acc;
+            }, new Map<string, typeof products>());
+
+            let catalogText = '📋 **Каталог товаров**\n\n';
+
+            for (const [category, items] of grouped) {
+              catalogText += `**${category}:**\n`;
+              items.slice(0, 5).forEach((item) => {
+                const price = item.price ? `${item.price} ${item.currency || config.default_currency || '₸'}` : 'Цена по запросу';
+                catalogText += `• ${item.name} — ${price}\n`;
+              });
+              catalogText += '\n';
+            }
+
+            catalogText += `Для полного прайс-листа нажмите 👉 [Google Sheets](https://docs.google.com/spreadsheets/d/${config.google_sheets_prices_id})`;
+
+            await bot.sendMessage(chatId, catalogText, { parse_mode: 'Markdown' });
+          } else if (businessId === 'construct_shop' || config.business_type === 'construction') {
+            let catalogText = '📋 **КАТАЛОГ СТРОЙМАТЕРИАЛОВ**\n\n';
+
+            for (const [, category] of Object.entries(constructionCatalog.categories)) {
+              catalogText += `**${category.name}:**\n`;
+              category.products.slice(0, 3).forEach((p: any) => {
+                catalogText += `• ${p.name}: ${p.price} ₸/${p.unit}\n`;
+              });
+              catalogText += '\n';
+            }
+
+            catalogText += '🚚 Доставка: 15000₸ по городу\n';
+            catalogText += '🏯 Склад: г. Алматы, Рыскулова 57\n';
+            catalogText += '☎️ +7 777 123 45 67';
+
+            await bot.sendMessage(chatId, catalogText, { parse_mode: 'Markdown' });
+          } else {
+            await bot.sendMessage(chatId, 'Каталог товаров пока не подключен.');
           }
-          
-          catalogText += '🚚 Доставка: 15000₸ по городу\n';
-          catalogText += '🏯 Склад: г. Алматы, Рыскулова 57\n';
-          catalogText += '☎️ +7 777 123 45 67';
-          
-          await bot.sendMessage(chatId, catalogText, { parse_mode: 'Markdown' });
+        } catch (error) {
+          console.error('Failed to load catalog from Google Sheets:', error);
+          await bot.sendMessage(chatId, 'Не удалось загрузить каталог из Google Sheets.');
         }
         break;
         
@@ -410,24 +603,55 @@ function initTelegramBot(businessId: string, token: string, config: any) {
         break;
         
       case 'generate_quote':
-        // Example quote generation
-        const proposalText = `
-📄 **КОММЕРЧЕСКОЕ ПРЕДЛОЖЕНИЕ**
-Дата: ${new Date().toLocaleDateString('ru-RU')}
-Клиент: @${callbackQuery.from.username}
+        if (!config.proposal_template_id) {
+          await bot.sendMessage(chatId, 'Шаблон коммерческого предложения не настроен.');
+          break;
+        }
 
-Пример расчета на 50 м² обоев:
-• Обои виниловые: 5 рулонов × 850₸ = 4,250₸
-• Клей для обоев: 2 уп. × 450₸ = 900₸
-• Грунтовка: 10л × 280₸ = 2,800₸
+        if (documentWorkflow.isCollecting(userId, 'telegram')) {
+          await bot.sendMessage(chatId, 'Продолжаем заполнение текущего документа.');
+          break;
+        }
 
-**Итого: 7,950₸**
-
-Условия: предоплата 100%, доставка в течение 1-2 дней
-`;
-        await bot.sendMessage(chatId, proposalText, { parse_mode: 'Markdown' });
+        await handleWorkflowResult(await documentWorkflow.startWorkflow({
+          userId,
+          platform: 'telegram',
+          type: 'proposal',
+          templateId: config.proposal_template_id,
+          folderId: config.google_drive_folder_id || undefined,
+          language: lang,
+          businessId,
+          businessName: config.business_name,
+          defaultValues: defaultWorkflowValues,
+          outputName: `Proposal-${new Date().toISOString().split('T')[0]}-${userId}`
+        }));
         break;
-        
+
+      case 'generate_invoice':
+        if (!config.invoice_template_id) {
+          await bot.sendMessage(chatId, 'Шаблон счета не настроен.');
+          break;
+        }
+
+        if (documentWorkflow.isCollecting(userId, 'telegram')) {
+          await bot.sendMessage(chatId, 'Сначала завершите текущий документ или отправьте "отмена".');
+          break;
+        }
+
+        await handleWorkflowResult(await documentWorkflow.startWorkflow({
+          userId,
+          platform: 'telegram',
+          type: 'invoice',
+          templateId: config.invoice_template_id,
+          folderId: config.google_drive_folder_id || undefined,
+          language: lang,
+          businessId,
+          businessName: config.business_name,
+          defaultValues: defaultWorkflowValues,
+          outputName: `Invoice-${new Date().toISOString().split('T')[0]}-${userId}`
+        }));
+        break;
+
       case 'manager':
         // Notify manager
         if (config.manager_telegram_id) {
@@ -510,11 +734,30 @@ async function generateResponse(
       const hasProductQuery = keywords.some(kw => message.toLowerCase().includes(kw));
       
       if (hasProductQuery) {
-        const searchResults = searchProducts(message);
+        let searchResults: any[] = [];
+
+        if (config.google_sheets_prices_id) {
+          try {
+            if (!googleIntegration.isInitialized()) {
+              await googleIntegration.init();
+            }
+            searchResults = await googleIntegration.searchProducts(config.google_sheets_prices_id, message);
+          } catch (error) {
+            console.error('Google Sheets product search error:', error);
+          }
+        }
+
+        if (searchResults.length === 0) {
+          searchResults = searchProducts(message);
+        }
+
         if (searchResults.length > 0) {
           enhancedSystemPrompt += `\n\nАктуальные товары по запросу клиента:\n`;
           searchResults.slice(0, 5).forEach(product => {
-            enhancedSystemPrompt += `- ${product.name}: ${product.price} ₸/${product.unit} (${product.availability})\n`;
+            const currency = product.currency || config.default_currency || '₸';
+            const unitText = product.unit ? `/${product.unit}` : '';
+            const availability = product.availability || (product.inStock ? 'В наличии' : 'Нет в наличии');
+            enhancedSystemPrompt += `- ${product.name}: ${product.price} ${currency}${unitText} (${availability})\n`;
           });
           enhancedSystemPrompt += `\nПредложите эти товары, рассчитайте необходимое количество и предложите сформировать коммерческое предложение.`;
         }
@@ -816,40 +1059,19 @@ app.post('/api/configs', async (req, res) => {
     if (existingResult.rows.length > 0) {
       // Update existing
       result = await pool.query(
-        `UPDATE bot_configs 
+        `UPDATE bot_configs
          SET business_name = $2, business_type = $3, system_prompt = $4,
-             ai_model = $5, telegram_enabled = $6, whatsapp_enabled = $7, 
+             ai_model = $5, telegram_enabled = $6, whatsapp_enabled = $7,
              telegram_token = $8, whatsapp_provider = $9, whatsapp_config = $10,
              google_drive_folder_id = $11, google_sheets_prices_id = $12,
-             google_sheets_leads_id = $13, kaspi_merchant_id = $14,
-             halyk_iin = $15, manager_telegram_id = $16, manager_whatsapp = $17,
-             wa_mode = $18, meta_verify_token = $19, meta_wa_token = $20,
-             phone_number_id = $21, graph_version = $22,
+             google_sheets_leads_id = $13, proposal_template_id = $14,
+             invoice_template_id = $15, default_currency = $16,
+             kaspi_merchant_id = $17, halyk_iin = $18, manager_telegram_id = $19,
+             manager_whatsapp = $20, catalog_enabled = $21, wa_mode = $22,
+             meta_verify_token = $23, meta_wa_token = $24, phone_number_id = $25,
+             graph_version = $26,
              updated_at = CURRENT_TIMESTAMP
          WHERE business_id = $1
-         RETURNING *`,
-        [config.business_id, config.business_name, config.business_type, 
-         config.system_prompt, config.ai_model || 'gpt-4o',
-         config.telegram_enabled || false, config.whatsapp_enabled || false,
-         config.telegram_token, config.whatsapp_provider, 
-         JSON.stringify(config.whatsapp_config || {}),
-         config.google_drive_folder_id, config.google_sheets_prices_id,
-         config.google_sheets_leads_id, config.kaspi_merchant_id,
-         config.halyk_iin, config.manager_telegram_id, config.manager_whatsapp,
-         config.wa_mode || 'twilio', config.meta_verify_token, config.meta_wa_token,
-         config.phone_number_id, config.graph_version || 'v23.0']
-      );
-    } else {
-      // Create new
-      result = await pool.query(
-        `INSERT INTO bot_configs 
-         (business_id, business_name, business_type, system_prompt, ai_model,
-          telegram_enabled, whatsapp_enabled, telegram_token, whatsapp_provider,
-          whatsapp_config, google_drive_folder_id, google_sheets_prices_id,
-          google_sheets_leads_id, kaspi_merchant_id, halyk_iin,
-          manager_telegram_id, manager_whatsapp, wa_mode, meta_verify_token,
-          meta_wa_token, phone_number_id, graph_version)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
          RETURNING *`,
         [config.business_id, config.business_name, config.business_type,
          config.system_prompt, config.ai_model || 'gpt-4o',
@@ -857,9 +1079,38 @@ app.post('/api/configs', async (req, res) => {
          config.telegram_token, config.whatsapp_provider,
          JSON.stringify(config.whatsapp_config || {}),
          config.google_drive_folder_id, config.google_sheets_prices_id,
-         config.google_sheets_leads_id, config.kaspi_merchant_id,
-         config.halyk_iin, config.manager_telegram_id, config.manager_whatsapp,
+         config.google_sheets_leads_id, config.proposal_template_id,
+         config.invoice_template_id, config.default_currency || 'KZT',
+         config.kaspi_merchant_id, config.halyk_iin, config.manager_telegram_id,
+         config.manager_whatsapp, config.catalog_enabled || false,
          config.wa_mode || 'twilio', config.meta_verify_token, config.meta_wa_token,
+         config.phone_number_id, config.graph_version || 'v23.0']
+      );
+    } else {
+      // Create new
+      result = await pool.query(
+        `INSERT INTO bot_configs
+         (business_id, business_name, business_type, system_prompt, ai_model,
+          telegram_enabled, whatsapp_enabled, telegram_token, whatsapp_provider,
+          whatsapp_config, google_drive_folder_id, google_sheets_prices_id,
+          google_sheets_leads_id, proposal_template_id, invoice_template_id,
+          default_currency, kaspi_merchant_id, halyk_iin,
+          manager_telegram_id, manager_whatsapp, catalog_enabled, wa_mode,
+          meta_verify_token, meta_wa_token, phone_number_id, graph_version)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+         RETURNING *`,
+        [config.business_id, config.business_name, config.business_type,
+         config.system_prompt, config.ai_model || 'gpt-4o',
+         config.telegram_enabled || false, config.whatsapp_enabled || false,
+         config.telegram_token, config.whatsapp_provider,
+         JSON.stringify(config.whatsapp_config || {}),
+         config.google_drive_folder_id, config.google_sheets_prices_id,
+         config.google_sheets_leads_id, config.proposal_template_id,
+         config.invoice_template_id, config.default_currency || 'KZT',
+         config.kaspi_merchant_id, config.halyk_iin,
+         config.manager_telegram_id, config.manager_whatsapp,
+         config.catalog_enabled || false, config.wa_mode || 'twilio',
+         config.meta_verify_token, config.meta_wa_token,
          config.phone_number_id, config.graph_version || 'v23.0']
       );
     }
@@ -898,20 +1149,23 @@ app.put('/api/configs/:businessId', async (req, res) => {
         google_drive_folder_id = $12,
         google_sheets_prices_id = $13,
         google_sheets_leads_id = $14,
-        kaspi_merchant_id = $15,
-        halyk_iin = $16,
-        bank_account = $17,
-        manager_telegram_id = $18,
-        manager_whatsapp = $19,
-        language_detection = $20,
-        sales_funnel = $21,
-        qr_payments = $22,
-        catalog_enabled = $23,
-        wa_mode = $24,
-        meta_verify_token = $25,
-        meta_wa_token = $26,
-        phone_number_id = $27,
-        graph_version = $28,
+        proposal_template_id = $15,
+        invoice_template_id = $16,
+        default_currency = $17,
+        kaspi_merchant_id = $18,
+        halyk_iin = $19,
+        bank_account = $20,
+        manager_telegram_id = $21,
+        manager_whatsapp = $22,
+        language_detection = $23,
+        sales_funnel = $24,
+        qr_payments = $25,
+        catalog_enabled = $26,
+        wa_mode = $27,
+        meta_verify_token = $28,
+        meta_wa_token = $29,
+        phone_number_id = $30,
+        graph_version = $31,
         updated_at = CURRENT_TIMESTAMP
       WHERE business_id = $1
       RETURNING *`,
@@ -930,6 +1184,9 @@ app.put('/api/configs/:businessId', async (req, res) => {
         config.google_drive_folder_id,
         config.google_sheets_prices_id,
         config.google_sheets_leads_id,
+        config.proposal_template_id,
+        config.invoice_template_id,
+        config.default_currency || 'KZT',
         config.kaspi_merchant_id,
         config.halyk_iin,
         config.bank_account,

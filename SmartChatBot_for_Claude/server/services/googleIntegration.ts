@@ -30,6 +30,7 @@ export class GoogleIntegration {
   private auth: OAuth2Client;
   private drive: any;
   private sheets: any;
+  private docs: any;
   private initialized: boolean = false;
   
   constructor() {
@@ -64,6 +65,7 @@ export class GoogleIntegration {
       
       this.drive = google.drive({ version: 'v3', auth: this.auth });
       this.sheets = google.sheets({ version: 'v4', auth: this.auth });
+      this.docs = google.docs({ version: 'v1', auth: this.auth });
       this.initialized = true;
     } catch (error) {
       console.error('Failed to initialize Google services:', error);
@@ -75,7 +77,138 @@ export class GoogleIntegration {
   isInitialized(): boolean {
     return this.initialized;
   }
-  
+
+  // === GOOGLE DOCS METHODS ===
+
+  private collectTextFromStructuralElements(elements: any[] = []): string {
+    let text = '';
+
+    for (const value of elements) {
+      if (value.paragraph?.elements) {
+        for (const element of value.paragraph.elements) {
+          if (element.textRun?.content) {
+            text += element.textRun.content;
+          }
+        }
+      }
+
+      if (value.table?.tableRows) {
+        for (const row of value.table.tableRows) {
+          for (const cell of row.tableCells || []) {
+            text += this.collectTextFromStructuralElements(cell.content || []);
+          }
+        }
+      }
+
+      if (value.tableOfContents?.content) {
+        text += this.collectTextFromStructuralElements(value.tableOfContents.content);
+      }
+    }
+
+    return text;
+  }
+
+  normalizePlaceholderName(name: string): string {
+    return name.replace(/[^A-Za-z0-9]+/g, '_').toUpperCase();
+  }
+
+  async getTemplatePlaceholders(templateId: string): Promise<string[]> {
+    if (!this.initialized) throw new Error('Google services not initialized');
+    if (!this.docs) throw new Error('Google Docs API not initialized');
+
+    const document = await this.docs.documents.get({ documentId: templateId });
+    const body = document.data.body;
+    const text = this.collectTextFromStructuralElements(body?.content || []);
+
+    const placeholders = new Set<string>();
+    const regex = /\{\{([^}]+)\}\}/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(text)) !== null) {
+      const placeholder = match[1].trim();
+      if (placeholder) {
+        placeholders.add(placeholder);
+      }
+    }
+
+    return Array.from(placeholders);
+  }
+
+  async generateDocumentFromTemplate(
+    templateId: string,
+    placeholders: Record<string, string>,
+    options: {
+      outputName: string;
+      folderId?: string;
+      cleanup?: boolean;
+    }
+  ): Promise<{ pdfBuffer: Buffer; documentId: string; webViewLink?: string }> {
+    if (!this.initialized) throw new Error('Google services not initialized');
+
+    const copyResponse = await this.drive.files.copy({
+      fileId: templateId,
+      requestBody: {
+        name: options.outputName,
+        parents: options.folderId ? [options.folderId] : undefined
+      }
+    });
+
+    const documentId = copyResponse.data.id;
+    if (!documentId) {
+      throw new Error('Failed to copy Google Docs template');
+    }
+
+    const requests = Object.entries(placeholders).map(([key, value]) => ({
+      replaceAllText: {
+        containsText: {
+          text: `{{${key}}}`,
+          matchCase: false
+        },
+        replaceText: value ?? ''
+      }
+    }));
+
+    if (requests.length > 0) {
+      await this.docs.documents.batchUpdate({
+        documentId,
+        requestBody: { requests }
+      });
+    }
+
+    const exportResponse = await this.drive.files.export(
+      { fileId: documentId, mimeType: 'application/pdf' },
+      { responseType: 'arraybuffer' }
+    );
+
+    const pdfBuffer = Buffer.from(exportResponse.data as ArrayBuffer);
+
+    let webViewLink: string | undefined;
+    try {
+      const fileInfo = await this.drive.files.get({
+        fileId: documentId,
+        fields: 'webViewLink'
+      });
+      webViewLink = fileInfo.data.webViewLink ?? undefined;
+    } catch (error) {
+      console.warn('Unable to fetch document web link:', error);
+    }
+
+    if (options.cleanup) {
+      try {
+        await this.drive.files.delete({ fileId: documentId });
+      } catch (error) {
+        console.warn('Failed to cleanup temporary Google Doc:', error);
+      }
+    }
+
+    return { pdfBuffer, documentId, webViewLink };
+  }
+
+  async deleteFile(fileId: string): Promise<void> {
+    if (!this.initialized) throw new Error('Google services not initialized');
+    await this.drive.files.delete({ fileId });
+  }
+
   // === GOOGLE DRIVE METHODS ===
   
   // Create folder for business
